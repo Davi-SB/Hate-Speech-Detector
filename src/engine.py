@@ -39,18 +39,35 @@ def train_one_epoch(
     Returns:
         Loss média do epoch.
     """
-    # ---------------------------------------------------------------
-    # TODO (Integrante D — Engenharia do Treinamento):
-    #   1. Colocar o modelo em modo de treino (model.train()).
-    #   2. Iterar sobre o dataloader.
-    #   3. Mover batch para device.
-    #   4. Forward pass → calcular loss.
-    #   5. loss.backward() → optimizer.step() → optimizer.zero_grad().
-    #   6. Acumular e retornar a loss média.
-    # ---------------------------------------------------------------
-    raise NotImplementedError(
-        "Integrante D — Engenharia do Treinamento: implementar train_one_epoch"
-    )
+    # 1. Colocar o modelo em modo de treino (habilita Dropout, etc)
+    model.train()
+    
+    total_loss = 0.0
+    
+    # 2. Iterar sobre o dataloader
+    for batch in dataloader:
+        
+        # 3. Mover batch para device (GPU ou CPU)
+        # O dataloader do Hugging Face geralmente entrega um dicionário
+        batch = {k: v.to(device) for k, v in batch.items()}
+        
+        # 4. Forward pass → calcular loss
+        # Ao passar **batch, passamos input_ids, attention_mask e labels.
+        # O modelo Hugging Face calcula a loss automaticamente se receber os 'labels'
+        outputs = model(**batch)
+        loss = outputs.loss
+        
+        # 5. loss.backward() → optimizer.step() → optimizer.zero_grad()
+        loss.backward()         # Retropropagação (calcula os gradientes)
+        optimizer.step()        # Atualiza os pesos
+        optimizer.zero_grad()   # Limpa os gradientes para o próximo lote
+        
+        # 6. Acumular a loss
+        total_loss += loss.item()
+        
+    # Calcular e retornar a loss média do epoch
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
 
 
 # ── Integrante E — Validação e Checkpoints ────────────────────────
