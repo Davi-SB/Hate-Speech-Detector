@@ -88,16 +88,30 @@ def evaluate(
     Returns:
         Tupla (val_loss, accuracy).
     """
-    # ---------------------------------------------------------------
-    # TODO (Integrante E — Validação e Checkpoints):
-    #   1. Colocar o modelo em modo de avaliação (model.eval()).
-    #   2. Desativar gradientes (torch.no_grad()).
-    #   3. Iterar sobre o dataloader, acumular loss e acertos.
-    #   4. Retornar (val_loss_média, accuracy).
-    # ---------------------------------------------------------------
-    raise NotImplementedError(
-        "Integrante E — Validação e Checkpoints: implementar evaluate"
-    )
+    model.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            outputs = model(**batch)
+            loss = outputs.loss
+            logits = outputs.logits
+            labels = batch["labels"]
+
+            predictions = torch.argmax(logits, dim=-1)
+
+            total_loss += loss.item()
+            total_correct += (predictions == labels).sum().item()
+            total_examples += labels.size(0)
+
+    avg_loss = total_loss / len(dataloader)
+    accuracy = total_correct / total_examples if total_examples > 0 else 0.0
+    return avg_loss, accuracy
 
 
 def save_checkpoint(
@@ -112,11 +126,5 @@ def save_checkpoint(
         tokenizer: Tokenizador utilizado.
         path: Diretório de destino no disco.
     """
-    # ---------------------------------------------------------------
-    # TODO (Integrante E — Validação e Checkpoints):
-    #   1. model.save_pretrained(path)
-    #   2. tokenizer.save_pretrained(path)
-    # ---------------------------------------------------------------
-    raise NotImplementedError(
-        "Integrante E — Validação e Checkpoints: implementar save_checkpoint"
-    )
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
