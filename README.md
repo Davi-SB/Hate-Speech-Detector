@@ -2,42 +2,32 @@
 
 Detector de discurso de ódio baseado em **Transformers** (PyTorch + Hugging Face).
 
-Este repositório implementa um pipeline completo de fine-tuning de um modelo de linguagem pré-treinado para classificação binária de texto.
+Este repositório implementa um pipeline completo de fine-tuning do **BERTimbau** (BERT pré-treinado em Português) para classificação binária de texto, incluindo treinamento com otimizações avançadas e um pipeline de inferência para classificar textos novos.
 
-## Objetivo da Entrega Parcial
+## Funcionalidades
 
-Construir e validar a **infraestrutura de aprendizado de máquina** — uma prova de conceito onde um texto consegue entrar no sistema, ser transformado em números, passar pelas camadas do Transformer, gerar um erro (loss) e fazer esse erro voltar para atualizar os pesos da rede.
+- **Fine-tuning de Transformer** — BERTimbau com head de classificação customizado
+- **Learning Rate Scheduler** — Warmup linear seguido de decay linear (padrão para fine-tuning de Transformers)
+- **Weighted Loss** — CrossEntropyLoss com pesos de classe para combater o desbalanceamento do dataset
+- **Métricas Detalhadas** — Precision, Recall, F1-Score e Confusion Matrix (via scikit-learn)
+- **Pipeline de Inferência** — Classificação de textos novos a partir de um checkpoint salvo
+- **Modo Interativo** — Interface de terminal para demonstração ao vivo
 
 ## Pipeline
 
 ```mermaid
 flowchart LR
-    A["1. Ingestao\n(HuggingFace)"] --> B["2. Vetorizacao\n(Tokenizacao)"]
-    B --> C["3. Empacotamento\n(DataLoader)"]
-    C --> D["4. Encoder\n(Transformer)"]
-    D --> E["5. Classificador\n(Camada Linear)"]
-    E --> F["6. Calculo de Erro\n(Loss)"]
-    F --> G["7. Backpropagation\n(Gradientes)"]
-    G --> H["8. Otimizador\n(Atualizacao de Pesos)"]
-    H -->|"pesos atualizados"| D
-
-    B -.-|"input_ids\nattention_mask"| B
-    D -.-|"representacao vetorial\n(hidden states)"| D
-    E -.-|"logits"| E
-    F -.-|"loss value"| F
-    G -.-|"gradientes"| G
+    A["1. Ingestao\n(HuggingFace)"] --> B["2. Limpeza\n(clean_text)"]
+    B --> C["3. Vetorizacao\n(Tokenizacao)"]
+    C --> D["4. Empacotamento\n(DataLoader)"]
+    D --> E["5. Encoder\n(BERTimbau)"]
+    E --> F["6. Classificador\n(Camada Linear)"]
+    F --> G["7. Calculo de Erro\n(Weighted Loss)"]
+    G --> H["8. Backpropagation\n(Gradientes)"]
+    H --> I["9. Otimizador\n(AdamW)"]
+    I --> J["10. Scheduler\n(Warmup + Decay)"]
+    J -->|"pesos atualizados"| E
 ```
-
-
-
-1. **Ingestão via Nuvem** — Carrega o dataset do Hugging Face e divide em treino/validação.
-2. **Vetorização** — O tokenizador converte texto cru em `input_ids` e `attention_mask`.
-3. **Empacotamento** — Os dados vetorizados são agrupados em lotes via `DataLoader`.
-4. **Encoder (Transformer)** — As camadas de atenção do modelo pré-treinado processam os tokens e produzem representações vetoriais ricas (hidden states).
-5. **Classificador (Camada Linear)** — Uma camada fully connected recebe a representação do encoder e projeta para `num_labels` logits (um score por classe).
-6. **Cálculo de Erro** — Logits são comparados com os rótulos reais para produzir a loss.
-7. **Backpropagation** — O erro é propagado de volta pela rede, calculando os gradientes de cada peso.
-8. **Otimizador** — Usa os gradientes para atualizar os pesos do encoder e do classificador, reduzindo o erro na próxima iteração.
 
 ## Estrutura do Projeto
 
@@ -45,10 +35,11 @@ flowchart LR
 Hate-Speech-Detector/
 ├── src/
 │   ├── __init__.py        # Torna src/ um pacote Python
-│   ├── dataset.py         # Módulo de Dados: conexão HuggingFace, tokenização, DataLoaders
-│   ├── model.py           # Módulo de Arquitetura: instancia o Transformer pré-treinado
-│   └── engine.py          # Módulo de Treinamento: lógica de treino, validação e checkpoints
-├── main.py                # Orquestrador: importa os módulos e executa o pipeline
+│   ├── dataset.py         # Módulo de Dados: ingestão, limpeza, tokenização, DataLoaders, class weights
+│   ├── model.py           # Módulo de Arquitetura: BERTimbau com head de classificação
+│   ├── engine.py          # Módulo de Treinamento: treino, validação, métricas e checkpoints
+│   └── inference.py       # Pipeline de Inferência: carrega checkpoint e classifica textos novos
+├── main.py                # Orquestrador: modos de treinamento e inferência via CLI
 ├── requirements.txt       # Dependências e versões
 ├── .gitignore             # Arquivos ignorados pelo Git
 └── README.md              # Documentação (este arquivo)
@@ -81,6 +72,8 @@ pip install -r requirements.txt
 
 ## Como Executar
 
+### Modo Treinamento (padrão)
+
 ```bash
 python main.py
 ```
@@ -88,34 +81,63 @@ python main.py
 O script irá:
 
 1. Detectar o device disponível (CPU ou GPU).
-2. Carregar o modelo Transformer pré-treinado e o tokenizador.
-3. Criar os DataLoaders de treino e validação.
-4. Executar o loop de treinamento (3 epochs por padrão).
-5. Salvar o modelo treinado em `checkpoints/`.
+2. Carregar o modelo BERTimbau pré-treinado e o tokenizador.
+3. Criar os DataLoaders de treino e validação com pré-processamento.
+4. Calcular os pesos de classe para a Weighted Loss.
+5. Configurar o otimizador AdamW e o Learning Rate Scheduler.
+6. Executar o loop de treinamento (3 epochs por padrão).
+7. Exibir métricas detalhadas (F1, Precision, Recall, Confusion Matrix) ao final de cada epoch.
+8. Salvar o modelo treinado em `checkpoints/`.
+
+### Modo Inferência
+
+Classificar um texto diretamente:
+
+```bash
+python main.py --infer --text "seu texto aqui"
+```
+
+Modo interativo (digite textos e receba classificações em tempo real):
+
+```bash
+python main.py --infer
+```
+
+Especificar um diretório de checkpoint diferente:
+
+```bash
+python main.py --infer --checkpoint caminho/para/checkpoint
+```
 
 ### Hiperparâmetros
 
 Os hiperparâmetros são definidos como constantes no topo de `main.py`:
 
+| Parâmetro        | Valor padrão | Descrição                                        |
+| ---------------- | ------------ | ------------------------------------------------ |
+| `BATCH_SIZE`     | 16           | Amostras por lote                                |
+| `LEARNING_RATE`  | 2e-5         | Taxa de aprendizado inicial do AdamW             |
+| `NUM_EPOCHS`     | 3            | Quantidade de epochs de treino                   |
+| `NUM_LABELS`     | 2            | Classes de classificação                         |
+| `WARMUP_RATIO`   | 0.1          | Fração dos steps totais usada para warmup do LR  |
+| `CHECKPOINT_DIR` | checkpoints/ | Diretório para salvar o modelo treinado          |
 
-| Parâmetro        | Valor padrão | Descrição                      |
-| ---------------- | ------------ | ------------------------------ |
-| `BATCH_SIZE`     | 16           | Amostras por lote              |
-| `LEARNING_RATE`  | 2e-5         | Taxa de aprendizado do AdamW   |
-| `NUM_EPOCHS`     | 3            | Quantidade de epochs de treino |
-| `NUM_LABELS`     | 2            | Classes de classificação       |
-| `CHECKPOINT_DIR` | checkpoints/ | Diretório para salvar o modelo |
+## Dependências
 
+| Pacote           | Uso                                              |
+| ---------------- | ------------------------------------------------ |
+| `torch`          | Framework de deep learning                       |
+| `transformers`   | Modelos pré-treinados, tokenizadores, schedulers |
+| `datasets`       | Carregamento de datasets do Hugging Face Hub     |
+| `accelerate`     | Utilitários para treinamento distribuído         |
+| `scikit-learn`   | Métricas de avaliação (F1, Precision, Recall)    |
 
 ## Equipe e Divisão de Tarefas
 
-
-| Integrante | Responsabilidade                            | Arquivo(s)                                 |
-| ---------- | ------------------------------------------- | ------------------------------------------ |
-| A          | Infraestrutura, orquestração e documentação | `main.py`, `README.md`, `requirements.txt` |
-| B          | Engenharia de dados via nuvem               | `src/dataset.py`                           |
-| C          | Arquitetura do modelo                       | `src/model.py`                             |
-| D          | Engenharia do treinamento                   | `src/engine.py`                            |
-| E          | Validação e checkpoints                     | `src/engine.py`                            |
-
-
+| Integrante | Responsabilidade                                         | Arquivo(s)                                               |
+| ---------- | -------------------------------------------------------- | -------------------------------------------------------- |
+| A (Davi)   | Infraestrutura, orquestração, inferência e documentação  | `main.py`, `src/inference.py`, `README.md`, `requirements.txt` |
+| B          | Engenharia de dados: dataset, limpeza, class weights     | `src/dataset.py`                                         |
+| C          | Arquitetura do modelo                                    | `src/model.py`                                           |
+| D          | Engenharia do treinamento: weighted loss, LR scheduler   | `src/engine.py`                                          |
+| E          | Validação: métricas detalhadas, relatórios, checkpoints  | `src/engine.py`                                          |

@@ -157,3 +157,57 @@ def create_dataloaders(
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
     # train_loader e eval_loader prontos para consumo
     return train_loader, eval_loader
+
+
+# ══════════════════════════════════════════════════════════════════
+# ENTREGA FINAL — Stubs para o Integrante B (Thaylson)
+# ══════════════════════════════════════════════════════════════════
+
+
+# ── TODO INTEGRANTE B ─────────────────────────────────────────────
+# Implementar a função clean_text() para a entrega final.
+# Ela deve remover ruído típico de dados da internet:
+#   - URLs (http/https)
+#   - Menções (@usuario)
+#   - Hashtags (#exemplo)
+#   - Emojis
+#   - Caracteres especiais repetidos
+#   - Espaços excessivos
+#   - Normalização de caixa (lowercase) quando aplicável
+#
+# Aplicar esta função ao texto ANTES da tokenização em
+# _prepare_split(). O inference.py (Integrante A) já tenta
+# chamar clean_text() automaticamente; quando esta função
+# estiver implementada, a inferência também será beneficiada.
+
+def clean_text(text: str) -> str:
+    """Remove ruído do texto (URLs, menções, emojis, etc).
+
+    TODO INTEGRANTE B: implementar a lógica de limpeza.
+    Quando implementada, remover o raise abaixo.
+    """
+    raise NotImplementedError("INTEGRANTE B: implementar clean_text()")
+
+
+# ── TODO INTEGRANTE B ─────────────────────────────────────────────
+# Implementar compute_class_weights() para calcular os pesos
+# inversamente proporcionais à frequência de cada classe.
+# A main.py já está preparada para chamar esta função e passar
+# os pesos para a CrossEntropyLoss.
+#
+# Exemplo de retorno para 2 classes:
+#   [1.2, 3.5]  (classe 0 mais frequente, classe 1 penalizada mais)
+#
+# Sugestão de implementação:
+#   1. Iterar sobre o dataloader e contar a frequência de cada label
+#   2. Calcular peso = total_amostras / (num_classes * freq_classe)
+#   3. Retornar como lista de floats na ordem [peso_classe_0, peso_classe_1, ...]
+
+def compute_class_weights(dataloader: DataLoader) -> list[float]:
+    """Calcula pesos de classe a partir do dataloader de treino.
+
+    TODO INTEGRANTE B: implementar o cálculo.
+    Retorna lista de floats, um peso por classe, na ordem dos IDs.
+    Quando implementada, remover o raise abaixo.
+    """
+    raise NotImplementedError("INTEGRANTE B: implementar compute_class_weights()")

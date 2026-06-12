@@ -1,25 +1,30 @@
-"""Hate-Speech Detector — Orquestrador Principal (Integrante A)
+"""Hate-Speech Detector — Orquestrador Principal (Integrante A — Davi)
 
 Conecta os módulos de dados, modelo e treinamento e executa o pipeline
 completo de fine-tuning de um Transformer para classificação de texto.
 
-Pipeline:
-    1. Carrega o modelo pré-treinado e o tokenizador.
-    2. Cria os DataLoaders de treino e validação.
-    3. Configura o otimizador.
-    4. Executa o loop de epochs (treino + avaliação).
-    5. Salva o checkpoint final no disco.
+Modos de execução:
+    Treinamento (padrão):
+        python main.py
+
+    Inferência (texto direto):
+        python main.py --infer --text "seu texto aqui"
+
+    Inferência (interativo):
+        python main.py --infer
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 from pathlib import Path
 
 import torch
+from transformers import get_linear_schedule_with_warmup
 
-from src.dataset import create_dataloaders
-from src.engine import evaluate, save_checkpoint, train_one_epoch
+from src.dataset import create_dataloaders, compute_class_weights
+from src.engine import evaluate, print_report, save_checkpoint, train_one_epoch
 from src.model import load_model
 
 # ── Configuração ──────────────────────────────────────────────────
@@ -28,6 +33,7 @@ BATCH_SIZE = 16
 LEARNING_RATE = 2e-5
 NUM_EPOCHS = 3
 NUM_LABELS = 2
+WARMUP_RATIO = 0.1
 CHECKPOINT_DIR = Path("checkpoints")
 
 # ── Logging ───────────────────────────────────────────────────────
@@ -40,10 +46,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Pipeline ──────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Hate-Speech Detector — Treinamento e Inferência",
+    )
+    parser.add_argument(
+        "--infer",
+        action="store_true",
+        help="Modo inferência: carrega checkpoint e classifica texto.",
+    )
+    parser.add_argument(
+        "--text",
+        type=str,
+        default=None,
+        help="Texto para classificar (usado com --infer).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=str(CHECKPOINT_DIR),
+        help=f"Diretório do checkpoint (padrão: {CHECKPOINT_DIR}).",
+    )
+    return parser.parse_args()
+
+
+# ── Modo Treinamento ─────────────────────────────────────────────
+
+
+def train(args: argparse.Namespace) -> None:
+    """Pipeline completo de treinamento."""
+
     # 1. Device ────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device selecionado: %s", device)
@@ -59,7 +94,18 @@ def main() -> None:
         batch_size=BATCH_SIZE,
     )
 
-    # 4. Otimizador ────────────────────────────────────────────────
+    # 4. Class Weights + Loss ponderada (Integrante B) ─────────────
+    # compute_class_weights() é implementada pelo Integrante B em
+    # dataset.py. Ela calcula pesos inversamente proporcionais à
+    # frequência de cada classe para combater o desbalanceamento.
+    logger.info("Calculando class weights…")
+    class_weights = compute_class_weights(train_loader)
+    loss_fn = torch.nn.CrossEntropyLoss(
+        weight=torch.tensor(class_weights, dtype=torch.float).to(device),
+    )
+    logger.info("Class weights: %s", class_weights)
+
+    # 5. Otimizador ────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     logger.info(
         "Otimizador: AdamW | lr=%.1e | params=%s",
@@ -67,29 +113,97 @@ def main() -> None:
         f"{sum(p.numel() for p in model.parameters()):,}",
     )
 
-    # 5. Loop de treinamento (Integrantes D e E) ───────────────────
+    # 6. Learning Rate Scheduler (Integrante A) ────────────────────
+    # Warmup linear nos primeiros passos, seguido de decay linear
+    # até zero. Estratégia padrão para fine-tuning de Transformers.
+    total_steps = len(train_loader) * NUM_EPOCHS
+    warmup_steps = int(total_steps * WARMUP_RATIO)
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
+    logger.info(
+        "Scheduler: linear warmup (%d steps) + decay (%d steps total)",
+        warmup_steps,
+        total_steps,
+    )
+
+    # 7. Loop de treinamento ───────────────────────────────────────
+    # train_one_epoch (Integrante D): recebe scheduler e loss_fn
+    # evaluate        (Integrante E): retorna dict de métricas
+    # print_report    (Integrante E): exibe métricas formatadas
     logger.info("Iniciando treinamento — %d epoch(s)", NUM_EPOCHS)
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss, accuracy = evaluate(model, val_loader, device)
-
-        logger.info(
-            "Epoch %d/%d  ·  train_loss=%.4f  ·  val_loss=%.4f  ·  accuracy=%.2f%%",
-            epoch,
-            NUM_EPOCHS,
-            train_loss,
-            val_loss,
-            accuracy * 100,
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device,
+            scheduler=scheduler,
+            loss_fn=loss_fn,
         )
 
-    # 6. Checkpoint (Integrante E) ─────────────────────────────────
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    save_checkpoint(model, tokenizer, str(CHECKPOINT_DIR))
-    logger.info("Checkpoint salvo em %s", CHECKPOINT_DIR.resolve())
+        metrics = evaluate(model, val_loader, device, loss_fn=loss_fn)
 
-    logger.info("Pipeline concluído com sucesso.")
+        logger.info("Epoch %d/%d  ·  train_loss=%.4f", epoch, NUM_EPOCHS, train_loss)
+        print_report(metrics, epoch, NUM_EPOCHS)
+
+    # 8. Checkpoint ────────────────────────────────────────────────
+    checkpoint_dir = Path(args.checkpoint)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    save_checkpoint(model, tokenizer, str(checkpoint_dir))
+    logger.info("Checkpoint salvo em %s", checkpoint_dir.resolve())
+
+    logger.info("Pipeline de treinamento concluído com sucesso.")
+
+
+# ── Modo Inferência ───────────────────────────────────────────────
+
+
+def infer(args: argparse.Namespace) -> None:
+    """Carrega checkpoint e classifica texto(s)."""
+    from src.inference import classify, load_pipeline
+
+    logger.info("Carregando pipeline de inferência…")
+    model, tokenizer, device, id2label = load_pipeline(args.checkpoint)
+
+    if args.text:
+        result = classify(args.text, model, tokenizer, device, id2label)
+        _print_result(args.text, result)
+    else:
+        logger.info("Modo interativo — digite 'sair' para encerrar.")
+        while True:
+            try:
+                text = input("\n📝 Digite um texto: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if text.strip().lower() == "sair":
+                break
+            result = classify(text, model, tokenizer, device, id2label)
+            _print_result(text, result)
+
+    logger.info("Inferência encerrada.")
+
+
+def _print_result(text: str, result: dict) -> None:
+    """Formata e exibe o resultado de uma classificação."""
+    print(
+        f"\n{'═' * 50}\n"
+        f"  Texto:      {text}\n"
+        f"  Classe:     {result['label']}\n"
+        f"  Confiança:  {result['confidence']:.2%}\n"
+        f"{'═' * 50}"
+    )
+
+
+# ── Entrypoint ────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    if args.infer:
+        infer(args)
+    else:
+        train(args)
