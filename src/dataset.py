@@ -1,56 +1,136 @@
-"""
-Módulo de Dados — Integrante B (Engenharia de Dados via Nuvem)
+"""Módulo de dados do projeto final.
 
-Responsabilidades:
-    - Conectar à biblioteca do Hugging Face e carregar o dataset de brinquedo.
-    - Aplicar tokenização ao texto cru, gerando input_ids e attention_mask.
-    - Dividir logicamente em train_dataset e eval_dataset.
-    - Empacotar os dados vetorizados em DataLoaders para alimentar o modelo.
+Responsável por carregar o dataset real, limpar o texto da internet,
+tokenizar os exemplos e expor os mapeamentos de rótulos e pesos de classe.
 """
 
 from __future__ import annotations
 
-from torch.utils.data import DataLoader
+import re
+from collections import Counter
+from typing import Any
+
 from datasets import Dataset, DatasetDict, load_dataset
+from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
-# Configurações globais para o módulo de dados
-# utilizei esse dataset mais simples para essa primeira etapa,
-#  mas ele pode ser facilmente substituído por outro mais complexo, caso necessário
-DATASET_NAME = "BRlkl/told-br-rewritten"
+DATASET_NAME = "projetomemoreba/mteb_told-br"
 
-# Possíveis nomes para a coluna de texto.
-# O código tenta encontrar automaticamente uma dessas colunas.
 TEXT_COLUMN_CANDIDATES = (
-    "rewritten_text",
     "text",
+    "rewritten_text",
     "sentence",
     "content",
     "tweet",
     "post",
     "comment",
 )
-# Possíveis nomes para a coluna de rótulo.
 LABEL_COLUMN_CANDIDATES = ("label", "labels", "class", "target", "toxicity")
+LABEL_TEXT_COLUMN_CANDIDATES = (
+    "label_text",
+    "label_name",
+    "class_name",
+    "target_text",
+)
 
 MAX_LENGTH = 128
 
-## Dicionários globais úteis para o restante do projeto
-# Exemplo:
-# LABEL2ID["seguro"] -> 0
-# ID2LABEL[0] -> "seguro"
-LABEL2ID: dict[str, int] | None = None
+LABEL2ID: dict[Any, int] | None = None
 ID2LABEL: dict[int, str] | None = None
+CLASS_WEIGHTS: list[float] | None = None
 
-# funcao auxiliar para achar as colunas, texto e rotulo
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", flags=re.IGNORECASE)
+_MENTION_RE = re.compile(r"@\w+", flags=re.UNICODE)
+_HASHTAG_RE = re.compile(r"#(\w+)", flags=re.UNICODE)
+_MULTI_SPACE_RE = re.compile(r"\s+")
+_REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}", flags=re.UNICODE)
+_SPECIAL_CHAR_RE = re.compile(r"[^0-9A-Za-zÀ-ÿ\s]")
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F1E0-\U0001F1FF"
+    "\U00002700-\U000027BF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA70-\U0001FAFF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
 def _pick_column(column_names: list[str], candidates: tuple[str, ...]) -> str:
     for candidate in candidates:
         if candidate in column_names:
             return candidate
     raise ValueError(
-        "Não foi possível identificar a coluna de texto/rótulo. "
+        "Não foi possível identificar a coluna esperada. "
         f"Colunas disponíveis: {column_names}"
     )
+
+
+def _pick_optional_column(
+    column_names: list[str],
+    candidates: tuple[str, ...],
+) -> str | None:
+    for candidate in candidates:
+        if candidate in column_names:
+            return candidate
+    return None
+
+
+def _normalize_label_value(value: Any) -> Any:
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def clean_text(text: str) -> str:
+    """Limpa ruído típico de texto da internet."""
+    if text is None:
+        return ""
+
+    cleaned = str(text).strip().lower()
+    cleaned = _URL_RE.sub(" ", cleaned)
+    cleaned = _MENTION_RE.sub(" ", cleaned)
+    cleaned = _HASHTAG_RE.sub(r"\1", cleaned)
+    cleaned = _EMOJI_RE.sub(" ", cleaned)
+    cleaned = _REPEATED_CHAR_RE.sub(r"\1\1", cleaned)
+    cleaned = _SPECIAL_CHAR_RE.sub(" ", cleaned)
+    cleaned = _MULTI_SPACE_RE.sub(" ", cleaned)
+    return cleaned.strip()
+
+
+def _build_label_mappings(
+    train_source: Dataset,
+    eval_source: Dataset,
+    label_column: str,
+    label_text_column: str | None,
+) -> tuple[dict[Any, int], dict[int, str]]:
+    train_labels = [_normalize_label_value(value) for value in train_source[label_column]]
+    eval_labels = [_normalize_label_value(value) for value in eval_source[label_column]]
+    unique_labels = sorted(set(train_labels).union(set(eval_labels)))
+
+    label2id: dict[Any, int] = {label: index for index, label in enumerate(unique_labels)}
+
+    if label_text_column is None:
+        id2label = {index: str(label) for label, index in label2id.items()}
+        return label2id, id2label
+
+    raw_to_text: dict[Any, str] = {}
+    for split in (train_source, eval_source):
+        for raw_label, label_text in zip(split[label_column], split[label_text_column]):
+            normalized_label = _normalize_label_value(raw_label)
+            raw_to_text.setdefault(normalized_label, str(label_text))
+
+    id2label = {
+        index: raw_to_text.get(label, str(label))
+        for label, index in label2id.items()
+    }
+    return label2id, id2label
 
 
 def _prepare_split(
@@ -58,33 +138,29 @@ def _prepare_split(
     tokenizer: PreTrainedTokenizerBase,
     text_column: str,
     label_column: str,
-    label2id: dict[str, int],
+    label2id: dict[Any, int],
 ) -> Dataset:
-    def tokenize_batch(batch: dict[str, list[str]]) -> dict[str, list]:
-        return tokenizer(
-            batch[text_column],
+    def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        cleaned_texts = [clean_text(text) for text in batch[text_column]]
+        tokenized = tokenizer(
+            cleaned_texts,
             truncation=True,
             padding="max_length",
             max_length=MAX_LENGTH,
         )
+        tokenized["labels"] = [label2id[_normalize_label_value(label)] for label in batch[label_column]]
+        return tokenized
 
     tokenized_dataset = split_dataset.map(
-        tokenize_batch,
+        preprocess_batch,
         batched=True,
-        remove_columns=[column for column in split_dataset.column_names if column != label_column],
+        remove_columns=list(split_dataset.column_names),
     )
 
-    if label_column != "labels":
-        tokenized_dataset = tokenized_dataset.rename_column(label_column, "labels")
-
-    # Converter rótulos textuais para inteiros usando label2id
-    def _map_labels(batch: dict[str, list[str]]) -> dict[str, list[int]]:
-        batch["labels"] = [label2id[l] for l in batch["labels"]]
-        return batch
-
-    tokenized_dataset = tokenized_dataset.map(_map_labels, batched=True)
-
-    tokenized_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    tokenized_dataset.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", "labels"],
+    )
     return tokenized_dataset
 
 
@@ -92,23 +168,14 @@ def create_dataloaders(
     tokenizer: PreTrainedTokenizerBase,
     batch_size: int,
 ) -> tuple[DataLoader, DataLoader]:
-    """Carrega o dataset, aplica tokenização e retorna (train_loader, val_loader).
-
-    Args:
-        tokenizer: Tokenizador do Transformer pré-treinado.
-        batch_size: Quantidade de amostras por lote.
-
-    Returns:
-        Tupla com (train_loader, val_loader) prontos para consumo pelo engine.
-    """
+    """Carrega o dataset, limpa, tokeniza e retorna os DataLoaders."""
     dataset = load_dataset(DATASET_NAME)
-    # separa train/eval  
-    # caso não existir validação no dataset, ele faz um split de 80/20 a partir do treino,
+
     if isinstance(dataset, DatasetDict):
-        split_names = list(dataset.keys())
         if "train" in dataset:
             train_source = dataset["train"]
         else:
+            split_names = list(dataset.keys())
             train_source = dataset[split_names[0]]
 
         if "validation" in dataset:
@@ -128,86 +195,72 @@ def create_dataloaders(
 
     text_column = _pick_column(train_source.column_names, TEXT_COLUMN_CANDIDATES)
     label_column = _pick_column(train_source.column_names, LABEL_COLUMN_CANDIDATES)
+    label_text_column = _pick_optional_column(
+        train_source.column_names,
+        LABEL_TEXT_COLUMN_CANDIDATES,
+    )
 
-    # Criar mapeamento label -> inteiro    
-    # Exemplo:
-    # {
-    #   "seguro": 0,
-    #   "inseguro": 1
-    # } 
-    # tester depois com um dataset com mais labels!!
-    train_labels = set(train_source.unique(label_column))
-    eval_labels = set(eval_source.unique(label_column))
-    all_labels = sorted(list(train_labels.union(eval_labels)))
-    label2id = {label: idx for idx, label in enumerate(all_labels)}
-    id2label = {idx: label for label, idx in label2id.items()}
+    label2id, id2label = _build_label_mappings(
+        train_source=train_source,
+        eval_source=eval_source,
+        label_column=label_column,
+        label_text_column=label_text_column,
+    )
 
     global LABEL2ID, ID2LABEL
     LABEL2ID = label2id
     ID2LABEL = id2label
 
     train_dataset = _prepare_split(
-        train_source, tokenizer, text_column, label_column, label2id
+        train_source,
+        tokenizer,
+        text_column,
+        label_column,
+        label2id,
     )
     eval_dataset = _prepare_split(
-        eval_source, tokenizer, text_column, label_column, label2id
+        eval_source,
+        tokenizer,
+        text_column,
+        label_column,
+        label2id,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
-    # train_loader e eval_loader prontos para consumo
     return train_loader, eval_loader
 
 
-# ══════════════════════════════════════════════════════════════════
-# ENTREGA FINAL — Stubs para o Integrante B (Thaylson)
-# ══════════════════════════════════════════════════════════════════
-
-
-# ── TODO INTEGRANTE B ─────────────────────────────────────────────
-# Implementar a função clean_text() para a entrega final.
-# Ela deve remover ruído típico de dados da internet:
-#   - URLs (http/https)
-#   - Menções (@usuario)
-#   - Hashtags (#exemplo)
-#   - Emojis
-#   - Caracteres especiais repetidos
-#   - Espaços excessivos
-#   - Normalização de caixa (lowercase) quando aplicável
-#
-# Aplicar esta função ao texto ANTES da tokenização em
-# _prepare_split(). O inference.py (Integrante A) já tenta
-# chamar clean_text() automaticamente; quando esta função
-# estiver implementada, a inferência também será beneficiada.
-
-def clean_text(text: str) -> str:
-    """Remove ruído do texto (URLs, menções, emojis, etc).
-
-    TODO INTEGRANTE B: implementar a lógica de limpeza.
-    Quando implementada, remover o raise abaixo.
-    """
-    raise NotImplementedError("INTEGRANTE B: implementar clean_text()")
-
-
-# ── TODO INTEGRANTE B ─────────────────────────────────────────────
-# Implementar compute_class_weights() para calcular os pesos
-# inversamente proporcionais à frequência de cada classe.
-# A main.py já está preparada para chamar esta função e passar
-# os pesos para a CrossEntropyLoss.
-#
-# Exemplo de retorno para 2 classes:
-#   [1.2, 3.5]  (classe 0 mais frequente, classe 1 penalizada mais)
-#
-# Sugestão de implementação:
-#   1. Iterar sobre o dataloader e contar a frequência de cada label
-#   2. Calcular peso = total_amostras / (num_classes * freq_classe)
-#   3. Retornar como lista de floats na ordem [peso_classe_0, peso_classe_1, ...]
-
 def compute_class_weights(dataloader: DataLoader) -> list[float]:
-    """Calcula pesos de classe a partir do dataloader de treino.
+    """Calcula pesos de classe inversamente proporcionais à frequência."""
+    label_counts: Counter[int] = Counter()
 
-    TODO INTEGRANTE B: implementar o cálculo.
-    Retorna lista de floats, um peso por classe, na ordem dos IDs.
-    Quando implementada, remover o raise abaixo.
-    """
-    raise NotImplementedError("INTEGRANTE B: implementar compute_class_weights()")
+    for batch in dataloader:
+        labels = batch["labels"]
+        if hasattr(labels, "detach"):
+            labels = labels.detach().cpu().tolist()
+        elif hasattr(labels, "cpu"):
+            labels = labels.cpu().tolist()
+        elif not isinstance(labels, list):
+            labels = list(labels)
+
+        label_counts.update(int(label) for label in labels)
+
+    if not label_counts:
+        raise ValueError("Não foi possível calcular class weights: dataloader vazio.")
+
+    num_classes = max(label_counts) + 1
+    total_examples = sum(label_counts.values())
+
+    weights: list[float] = []
+    for class_id in range(num_classes):
+        frequency = label_counts.get(class_id, 0)
+        if frequency == 0:
+            raise ValueError(
+                f"Classe {class_id} não apareceu no treino e não pode receber peso."
+            )
+        weights.append(total_examples / (num_classes * frequency))
+
+    global CLASS_WEIGHTS
+    CLASS_WEIGHTS = weights
+    return weights
