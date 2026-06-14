@@ -8,8 +8,11 @@ acurácia e salvamento de checkpoints).
 
 from __future__ import annotations
 
+import os
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 
@@ -77,7 +80,8 @@ def evaluate(
     model: PreTrainedModel,
     dataloader: DataLoader,
     device: torch.device,
-) -> tuple[float, float]:
+    loss_fn: torch.nn.Module | None = None,
+) -> dict:
     """Avalia o modelo sem atualizar pesos.
 
     Args:
@@ -86,33 +90,110 @@ def evaluate(
         device: Dispositivo de execução.
 
     Returns:
-        Tupla (val_loss, accuracy).
+        Dicionário com métricas de validação.
     """
     model.eval()
 
     total_loss = 0.0
-    total_correct = 0
     total_examples = 0
+    all_preds: list[int] = []
+    all_labels: list[int] = []
 
     with torch.no_grad():
         for batch in dataloader:
+            labels = batch.pop("labels").to(device)
             batch = {k: v.to(device) for k, v in batch.items()}
-
-            outputs = model(**batch)
-            loss = outputs.loss
-            logits = outputs.logits
-            labels = batch["labels"]
-
+            
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+            )
+            loss = loss_fn(logits, labels) if loss_fn is not None else torch.nn.functional.cross_entropy(logits, labels)
             predictions = torch.argmax(logits, dim=-1)
 
-            total_loss += loss.item()
-            total_correct += (predictions == labels).sum().item()
-            total_examples += labels.size(0)
+            batch_size = labels.size(0)
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
+            all_preds.extend(predictions.detach().cpu().tolist())
+            all_labels.extend(labels.detach().cpu().tolist())
 
-    avg_loss = total_loss / len(dataloader)
-    accuracy = total_correct / total_examples if total_examples > 0 else 0.0
-    return avg_loss, accuracy
+    avg_loss = total_loss / total_examples if total_examples > 0 else 0.0
 
+    if total_examples > 0:
+        accuracy = sum(int(pred == label) for pred, label in zip(all_preds, all_labels)) / total_examples
+        precision = precision_score(all_labels, all_preds, zero_division=0)
+        recall = recall_score(all_labels, all_preds, zero_division=0)
+        f1 = f1_score(all_labels, all_preds, zero_division=0)
+        matrix = confusion_matrix(all_labels, all_preds, labels=[0, 1])
+    else:
+        accuracy = 0.0
+        precision = 0.0
+        recall = 0.0
+        f1 = 0.0
+        matrix = np.zeros((2, 2), dtype=int)
+
+    return {
+        "val_loss": float(avg_loss),
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "confusion_matrix": matrix,
+    }
+
+def print_report(metrics: dict, epoch: int, num_epochs: int) -> None:
+    """Exibe as métricas de validação em formato legível."""
+    matrix = np.asarray(metrics["confusion_matrix"])
+
+    if matrix.shape == (2, 2):
+        tn, fp = matrix[0]
+        fn, tp = matrix[1]
+        matrix_lines = [
+            "        Pred 0  Pred 1",
+            f"Real 0  [{tn:4d}  {fp:4d}]",
+            f"Real 1  [{fn:4d}  {tp:4d}]",
+        ]
+    else:
+        matrix_lines = [str(matrix)]
+
+    precision = metrics["precision"]
+    recall = metrics["recall"]
+    f1 = metrics["f1"]
+
+    if precision >= recall:
+        analysis = (
+            "Análise: o modelo está mais conservador nas predições positivas, "
+            "com menos falsos positivos do que falsos negativos."
+        )
+    else:
+        analysis = (
+            "Análise: o modelo recupera mais casos positivos, mas ainda gera "
+            "mais falsos positivos."
+        )
+
+    if f1 >= 0.8:
+        quality_note = "O equilíbrio entre precisão e recall está bom para esta validação."
+    elif f1 >= 0.6:
+        quality_note = "O desempenho é moderado e ainda pode melhorar no equilíbrio entre erros."
+    else:
+        quality_note = "O desempenho ainda está baixo e o modelo precisa de ajuste."
+
+    print("═" * 40)
+    print(f" Epoch {epoch}/{num_epochs}")
+    print("─" * 40)
+    print(f" Val Loss:   {metrics['val_loss']:.4f}")
+    print(f" Accuracy:   {metrics['accuracy']:.2%}")
+    print(f" Precision:  {precision:.4f}")
+    print(f" Recall:     {recall:.4f}")
+    print(f" F1-Score:   {f1:.4f}")
+    print()
+    print(" Confusion Matrix:")
+    for line in matrix_lines:
+        print(f" {line}")
+    print()
+    print(f" {analysis}")
+    print(f" {quality_note}")
+    print("═" * 40)
 
 def save_checkpoint(
     model: PreTrainedModel,
@@ -126,7 +207,8 @@ def save_checkpoint(
         tokenizer: Tokenizador utilizado.
         path: Diretório de destino no disco.
     """
-    model.save_pretrained(path)
+    os.makedirs(path, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(path, "model.pt"))
     tokenizer.save_pretrained(path)
 
 
