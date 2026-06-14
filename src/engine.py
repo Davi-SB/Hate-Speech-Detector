@@ -1,5 +1,4 @@
-"""
-Módulo de Treinamento e Validação — Integrantes D e E
+"""Módulo de Treinamento e Validação — Integrantes D e E
 
 Contém a lógica matemática de treino (forward pass, loss, backward pass,
 otimização de pesos) e de avaliação (inferência sem gradientes, cálculo de
@@ -9,6 +8,7 @@ acurácia e salvamento de checkpoints).
 from __future__ import annotations
 
 import os
+from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -24,50 +24,65 @@ def train_one_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scheduler: Any | None = None,
+    loss_fn: torch.nn.Module | None = None,
 ) -> float:
-    """Executa um epoch completo de treino.
+    # Docstring explicativa para a função train_one_epoch
+    """Executa um epoch completo de treino adaptado para o modelo customizado.
 
     Para cada lote:
-        1. Forward pass → logits
-        2. Cálculo da loss
-        3. Backward pass (retropropagação)
-        4. Passo do optimizer (atualização de pesos)
+        1. Separação dos labels para evitar o bug de assinatura do nn.Module
+        2. Forward pass explícito enviando apenas os tensores esperados
+        3. Cálculo da loss utilizando a loss_fn externa (com class weights)
+        4. Backward pass (retropropagação) e atualização de pesos
+        5. Passo do Learning Rate Scheduler
 
     Args:
-        model: Modelo Transformer.
+        model: Modelo Transformer (BERTimbauBinaryClassifier).
         dataloader: DataLoader de treino.
         optimizer: Otimizador (ex.: AdamW).
         device: Dispositivo de execução.
+        scheduler: Learning Rate Scheduler opcional (get_linear_schedule_with_warmup).
+        loss_fn: Função de perda externa (CrossEntropyLoss configurada com pesos).
 
     Returns:
         Loss média do epoch.
     """
-    # 1. Colocar o modelo em modo de treino (habilita Dropout, etc)
+    # 1. Colocar o modelo em modo de treino
     model.train()
-    
     total_loss = 0.0
-    
+
     # 2. Iterar sobre o dataloader
     for batch in dataloader:
         
-        # 3. Mover batch para device (GPU ou CPU)
-        # O dataloader do Hugging Face geralmente entrega um dicionário
+        # 3. CORREÇÃO DO BUG: Remover as labels do dicionário antes do forward pass
+        labels = batch.pop("labels").to(device)
         batch = {k: v.to(device) for k, v in batch.items()}
-        
-        # 4. Forward pass → calcular loss
-        # Ao passar **batch, passamos input_ids, attention_mask e labels.
-        # O modelo Hugging Face calcula a loss automaticamente se receber os 'labels'
-        outputs = model(**batch)
-        loss = outputs.loss
-        
-        # 5. loss.backward() → optimizer.step() → optimizer.zero_grad()
-        loss.backward()         # Retropropagação (calcula os gradientes)
-        optimizer.step()        # Atualiza os pesos
+
+        # 4. Forward pass passando apenas os argumentos necessários
+        logits = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"]
+        )
+
+        # 5. Calcular a loss com a função externa que contém os pesos de classe
+        if loss_fn is None:
+            loss = torch.nn.functional.cross_entropy(logits, labels)
+        else:
+            loss = loss_fn(logits, labels)
+
+        # 6. Retropropagação e otimização
+        loss.backward()         # Calcula os gradientes
+        optimizer.step()        # Atualiza os pesos do modelo
         optimizer.zero_grad()   # Limpa os gradientes para o próximo lote
-        
-        # 6. Acumular a loss
+
+        # 7. Atualizar o scheduler a cada passo (passo do Warmup/Decay)
+        if scheduler is not None:
+            scheduler.step()
+
+        # Acumular a loss
         total_loss += loss.item()
-        
+
     # Calcular e retornar a loss média do epoch
     avg_loss = total_loss / len(dataloader)
     return avg_loss
@@ -81,13 +96,14 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
     loss_fn: torch.nn.Module | None = None,
-) -> dict:
-    """Avalia o modelo sem atualizar pesos.
+) -> dict[str, float | np.ndarray]:
+    """Avalia o modelo extraindo métricas completas com o Scikit-Learn.
 
     Args:
         model: Modelo Transformer.
         dataloader: DataLoader de validação.
         device: Dispositivo de execução.
+        loss_fn: Função de perda externa.
 
     Returns:
         Dicionário com métricas de validação.
@@ -101,19 +117,29 @@ def evaluate(
 
     with torch.no_grad():
         for batch in dataloader:
+            # Isolar labels e mover tensores para o dispositivo de execução
             labels = batch.pop("labels").to(device)
             batch = {k: v.to(device) for k, v in batch.items()}
-            
+
+            # Forward pass
             logits = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
             )
-            loss = loss_fn(logits, labels) if loss_fn is not None else torch.nn.functional.cross_entropy(logits, labels)
+            
+            # Cálculo da Loss
+            if loss_fn is not None:
+                loss = loss_fn(logits, labels)
+            else:
+                loss = torch.nn.functional.cross_entropy(logits, labels)
+                
             predictions = torch.argmax(logits, dim=-1)
 
             batch_size = labels.size(0)
             total_loss += loss.item() * batch_size
             total_examples += batch_size
+            
+            # Coletar predições e referências reais para o cálculo final do sklearn
             all_preds.extend(predictions.detach().cpu().tolist())
             all_labels.extend(labels.detach().cpu().tolist())
 
@@ -140,6 +166,7 @@ def evaluate(
         "f1": float(f1),
         "confusion_matrix": matrix,
     }
+
 
 def print_report(metrics: dict, epoch: int, num_epochs: int) -> None:
     """Exibe as métricas de validação em formato legível."""
@@ -195,22 +222,20 @@ def print_report(metrics: dict, epoch: int, num_epochs: int) -> None:
     print(f" {quality_note}")
     print("═" * 40)
 
+
 def save_checkpoint(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     path: str,
 ) -> None:
-    """Salva o modelo e o tokenizador treinados no disco.
+    """Salva o modelo e o tokenizador treinados de forma compatível com nn.Module.
 
-    Args:
-        model: Modelo treinado.
-        tokenizer: Tokenizador utilizado.
-        path: Diretório de destino no disco.
+    Como o modelo é uma classe customizada baseada pura em nn.Module, a persistência
+    é feita via salvamento do state_dict interno no arquivo model.pt.
     """
     os.makedirs(path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(path, "model.pt"))
     tokenizer.save_pretrained(path)
-
 
 # ══════════════════════════════════════════════════════════════════
 # ENTREGA FINAL — Guias para os Integrantes D (Anselmo) e E (Robert)
@@ -220,13 +245,6 @@ def save_checkpoint(
 # Para a entrega final, elas precisam ser MODIFICADAS conforme
 # descrito abaixo. A main.py (Integrante A) já está preparada
 # para chamar as novas assinaturas.
-#
-# ⚠️  BUG IMPORTANTE: nosso modelo (BERTimbauBinaryClassifier) é
-# um nn.Module customizado que retorna APENAS logits. Ele NÃO
-# aceita 'labels' como parâmetro e NÃO retorna outputs.loss.
-# Por isso, a loss deve ser calculada EXTERNAMENTE com a loss_fn
-# que a main.py passa como parâmetro.
-
 
 # ── TODO INTEGRANTE D (Anselmo) ──────────────────────────────────
 #
@@ -256,80 +274,3 @@ def save_checkpoint(
 # O restante (backward, zero_grad, acumulação de loss) permanece
 # igual. A main.py cria o scheduler com
 # get_linear_schedule_with_warmup e passa aqui.
-
-
-# ── TODO INTEGRANTE E (Robert) ───────────────────────────────────
-#
-# 1) MODIFICAR a função evaluate para a nova assinatura:
-#
-#   def evaluate(
-#       model, dataloader, device,
-#       loss_fn=None,
-#   ) -> dict:
-#
-# Mudanças necessárias:
-#
-#   a) Mesma lógica do train para calcular loss externamente:
-#      labels = batch.pop("labels")
-#      logits = model(input_ids=..., attention_mask=...)
-#      loss = loss_fn(logits, labels)
-#
-#   b) Coletar TODAS as predições e labels do dataset inteiro
-#      em duas listas (all_preds e all_labels).
-#
-#   c) Após o loop, calcular métricas com sklearn:
-#      from sklearn.metrics import (
-#          precision_score, recall_score, f1_score,
-#          confusion_matrix,
-#      )
-#      OBS: sklearn já foi adicionado ao requirements.txt.
-#
-#   d) Retornar um dicionário em vez da tupla (loss, accuracy):
-#      return {
-#          "val_loss": float,
-#          "accuracy": float,
-#          "precision": float,
-#          "recall": float,
-#          "f1": float,
-#          "confusion_matrix": np.ndarray,
-#      }
-#
-# 2) CRIAR a função print_report:
-#
-#   def print_report(metrics: dict, epoch: int, num_epochs: int) -> None:
-#
-# Esta função deve formatar e exibir os resultados de forma legível.
-# Exemplo de saída esperada:
-#
-#   ════════════════════════════════════════
-#    Epoch 2/3
-#   ────────────────────────────────────────
-#    Val Loss:   0.4321
-#    Accuracy:   87.50%
-#    Precision:  0.8421
-#    Recall:     0.7619
-#    F1-Score:   0.8000
-#
-#    Confusion Matrix:
-#          Pred 0  Pred 1
-#    Real 0  [150    12]
-#    Real 1  [ 25    80]
-#   ════════════════════════════════════════
-#
-# A main.py chama print_report(metrics, epoch, NUM_EPOCHS) ao
-# final de cada epoch.
-#
-# 3) CORRIGIR a função save_checkpoint:
-#
-# A versão atual usa model.save_pretrained() que NÃO funciona
-# com nosso nn.Module customizado (BERTimbauBinaryClassifier).
-# Substituir por:
-#
-#   import os
-#   def save_checkpoint(model, tokenizer, path):
-#       os.makedirs(path, exist_ok=True)
-#       torch.save(model.state_dict(), os.path.join(path, "model.pt"))
-#       tokenizer.save_pretrained(path)
-#
-# O inference.py (Integrante A) já está preparado para carregar
-# o checkpoint nesse formato (model.pt + tokenizer files).
