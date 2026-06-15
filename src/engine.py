@@ -27,7 +27,6 @@ def train_one_epoch(
     scheduler: Any | None = None,
     loss_fn: torch.nn.Module | None = None,
 ) -> float:
-    # Docstring explicativa para a função train_one_epoch
     """Executa um epoch completo de treino adaptado para o modelo customizado.
 
     Para cada lote:
@@ -52,18 +51,27 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
 
-    # 2. Iterar sobre o dataloader
+    # 2. Iterar sobre os lotes fornecidos pelo dataloader
     for batch in dataloader:
         
-        # 3. CORREÇÃO DO BUG: Remover as labels do dicionário antes do forward pass
+        # 3. Remover as labels do dicionário antes do forward pass
+        # Garantimos que as labels também são movidas para o dispositivo correto (GPU/CPU)
         labels = batch.pop("labels").to(device)
         batch = {k: v.to(device) for k, v in batch.items()}
+
+        # Garante que os gradientes sejam zerados a cada novo passo
+        optimizer.zero_grad()
 
         # 4. Forward pass passando apenas os argumentos necessários
         logits = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"]
         )
+
+        # Se o modelo retornar um objeto do Hugging Face contendo os logits, extraímos o atributo.
+        # Caso seja uma classe customizada retornando o tensor diretamente, usamos os logits diretamente.
+        if hasattr(logits, "logits"):
+            logits = logits.logits
 
         # 5. Calcular a loss com a função externa que contém os pesos de classe
         if loss_fn is None:
@@ -72,15 +80,14 @@ def train_one_epoch(
             loss = loss_fn(logits, labels)
 
         # 6. Retropropagação e otimização
-        loss.backward()         # Calcula os gradientes
-        optimizer.step()        # Atualiza os pesos do modelo
-        optimizer.zero_grad()   # Limpa os gradientes para o próximo lote
+        loss.backward()         # Calcula os gradientes matemáticos
+        optimizer.step()        # Atualiza os pesos da rede neural
 
         # 7. Atualizar o scheduler a cada passo (passo do Warmup/Decay)
         if scheduler is not None:
             scheduler.step()
 
-        # Acumular a loss
+        # Acumular a loss real da iteração
         total_loss += loss.item()
 
     # Calcular e retornar a loss média do epoch
@@ -236,41 +243,3 @@ def save_checkpoint(
     os.makedirs(path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(path, "model.pt"))
     tokenizer.save_pretrained(path)
-
-# ══════════════════════════════════════════════════════════════════
-# ENTREGA FINAL — Guias para os Integrantes D (Anselmo) e E (Robert)
-# ══════════════════════════════════════════════════════════════════
-#
-# As funções acima são da entrega parcial e servem de referência.
-# Para a entrega final, elas precisam ser MODIFICADAS conforme
-# descrito abaixo. A main.py (Integrante A) já está preparada
-# para chamar as novas assinaturas.
-
-# ── TODO INTEGRANTE D (Anselmo) ──────────────────────────────────
-#
-# MODIFICAR a função train_one_epoch para a nova assinatura:
-#
-#   def train_one_epoch(
-#       model, dataloader, optimizer, device,
-#       scheduler=None, loss_fn=None,
-#   ) -> float:
-#
-# Mudanças necessárias dentro do loop de batch:
-#
-#   1. Separar labels do batch ANTES do forward pass:
-#      labels = batch.pop("labels")
-#
-#   2. Chamar o modelo apenas com input_ids e attention_mask:
-#      logits = model(input_ids=batch["input_ids"],
-#                     attention_mask=batch["attention_mask"])
-#
-#   3. Calcular a loss com a função externa:
-#      loss = loss_fn(logits, labels)
-#
-#   4. Após optimizer.step(), adicionar o passo do scheduler:
-#      if scheduler is not None:
-#          scheduler.step()
-#
-# O restante (backward, zero_grad, acumulação de loss) permanece
-# igual. A main.py cria o scheduler com
-# get_linear_schedule_with_warmup e passa aqui.
