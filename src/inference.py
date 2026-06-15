@@ -6,8 +6,8 @@ checkpoint válido existir em disco.
 
 Uso direto (sem main.py):
     from src.inference import load_pipeline, classify
-    model, tokenizer, device = load_pipeline("checkpoints")
-    resultado = classify("seu texto aqui", model, tokenizer, device)
+    model, tokenizer, device, id2label = load_pipeline("checkpoints")
+    resultado = classify("seu texto aqui", model, tokenizer, device, id2label)
 """
 
 from __future__ import annotations
