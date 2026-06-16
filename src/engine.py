@@ -26,15 +26,18 @@ def train_one_epoch(
     device: torch.device,
     scheduler: Any | None = None,
     loss_fn: torch.nn.Module | None = None,
+    max_grad_norm: float = 1.0,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> float:
     """Executa um epoch completo de treino adaptado para o modelo customizado.
 
     Para cada lote:
         1. Separação dos labels para evitar o bug de assinatura do nn.Module
-        2. Forward pass explícito enviando apenas os tensores esperados
+        2. Forward pass (com autocast fp16 quando disponível)
         3. Cálculo da loss utilizando a loss_fn externa (com class weights)
-        4. Backward pass (retropropagação) e atualização de pesos
-        5. Passo do Learning Rate Scheduler
+        4. Backward pass com gradient scaling (mixed precision)
+        5. Gradient clipping para estabilidade do treino
+        6. Atualização de pesos e passo do Learning Rate Scheduler
 
     Args:
         model: Modelo Transformer (BERTimbauBinaryClassifier).
@@ -43,54 +46,50 @@ def train_one_epoch(
         device: Dispositivo de execução.
         scheduler: Learning Rate Scheduler opcional (get_linear_schedule_with_warmup).
         loss_fn: Função de perda externa (CrossEntropyLoss configurada com pesos).
+        max_grad_norm: Norma máxima para gradient clipping.
+        scaler: GradScaler para mixed precision (None desativa AMP).
 
     Returns:
         Loss média do epoch.
     """
-    # 1. Colocar o modelo em modo de treino
     model.train()
     total_loss = 0.0
+    use_amp = scaler is not None
 
-    # 2. Iterar sobre os lotes fornecidos pelo dataloader
     for batch in dataloader:
-        
-        # 3. Remover as labels do dicionário antes do forward pass
-        # Garantimos que as labels também são movidas para o dispositivo correto (GPU/CPU)
         labels = batch.pop("labels").to(device)
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        # Garante que os gradientes sejam zerados a cada novo passo
         optimizer.zero_grad()
 
-        # 4. Forward pass passando apenas os argumentos necessários
-        logits = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"]
-        )
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+            )
+            if hasattr(logits, "logits"):
+                logits = logits.logits
+            if loss_fn is None:
+                loss = torch.nn.functional.cross_entropy(logits, labels)
+            else:
+                loss = loss_fn(logits, labels)
 
-        # Se o modelo retornar um objeto do Hugging Face contendo os logits, extraímos o atributo.
-        # Caso seja uma classe customizada retornando o tensor diretamente, usamos os logits diretamente.
-        if hasattr(logits, "logits"):
-            logits = logits.logits
-
-        # 5. Calcular a loss com a função externa que contém os pesos de classe
-        if loss_fn is None:
-            loss = torch.nn.functional.cross_entropy(logits, labels)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            loss = loss_fn(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
 
-        # 6. Retropropagação e otimização
-        loss.backward()         # Calcula os gradientes matemáticos
-        optimizer.step()        # Atualiza os pesos da rede neural
-
-        # 7. Atualizar o scheduler a cada passo (passo do Warmup/Decay)
         if scheduler is not None:
             scheduler.step()
 
-        # Acumular a loss real da iteração
         total_loss += loss.item()
 
-    # Calcular e retornar a loss média do epoch
     avg_loss = total_loss / len(dataloader)
     return avg_loss
 
@@ -103,6 +102,7 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
     loss_fn: torch.nn.Module | None = None,
+    use_amp: bool = False,
 ) -> dict[str, float | np.ndarray]:
     """Avalia o modelo extraindo métricas completas com o Scikit-Learn.
 
@@ -128,17 +128,15 @@ def evaluate(
             labels = batch.pop("labels").to(device)
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # Forward pass
-            logits = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-            )
-            
-            # Cálculo da Loss
-            if loss_fn is not None:
-                loss = loss_fn(logits, labels)
-            else:
-                loss = torch.nn.functional.cross_entropy(logits, labels)
+            with torch.amp.autocast(device.type, enabled=use_amp):
+                logits = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
+                if loss_fn is not None:
+                    loss = loss_fn(logits, labels)
+                else:
+                    loss = torch.nn.functional.cross_entropy(logits, labels)
                 
             predictions = torch.argmax(logits, dim=-1)
 
@@ -175,7 +173,12 @@ def evaluate(
     }
 
 
-def print_report(metrics: dict, epoch: int, num_epochs: int) -> None:
+def print_report(
+    metrics: dict,
+    epoch: int,
+    num_epochs: int,
+    title: str | None = None,
+) -> None:
     """Exibe as métricas de validação em formato legível."""
     matrix = np.asarray(metrics["confusion_matrix"])
 
@@ -213,7 +216,7 @@ def print_report(metrics: dict, epoch: int, num_epochs: int) -> None:
         quality_note = "O desempenho ainda está baixo e o modelo precisa de ajuste."
 
     print("═" * 40)
-    print(f" Epoch {epoch}/{num_epochs}")
+    print(f" {title}" if title else f" Epoch {epoch}/{num_epochs}")
     print("─" * 40)
     print(f" Val Loss:   {metrics['val_loss']:.4f}")
     print(f" Accuracy:   {metrics['accuracy']:.2%}")

@@ -9,7 +9,13 @@ Este repositório implementa um pipeline completo de fine-tuning do **BERTimbau*
 - **Fine-tuning de Transformer** — BERTimbau com head de classificação customizado
 - **Learning Rate Scheduler** — Warmup linear seguido de decay linear (padrão para fine-tuning de Transformers)
 - **Weighted Loss** — CrossEntropyLoss com pesos de classe para combater o desbalanceamento do dataset
+- **Gradient Clipping** — Limita a norma dos gradientes para estabilizar o treinamento
+- **Mixed Precision (fp16)** — Acelera o treinamento em GPU via autocast e GradScaler
+- **Early Stopping** — Interrompe o treinamento automaticamente quando a val_loss para de melhorar
+- **Reprodutibilidade** — Seeds fixas (Python, NumPy, PyTorch) e cuDNN determinístico
+- **Avaliação em Test Set** — Avaliação final em conjunto de teste separado (holdout)
 - **Métricas Detalhadas** — Precision, Recall, F1-Score e Confusion Matrix (via scikit-learn)
+- **Persistência de Métricas** — Histórico de treinamento e resultados salvos em `metrics.json`
 - **Pipeline de Inferência** — Classificação de textos novos a partir de um checkpoint salvo
 - **Modo Interativo** — Interface de terminal para demonstração ao vivo
 
@@ -80,14 +86,16 @@ python main.py
 
 O script irá:
 
-1. Detectar o device disponível (CPU ou GPU).
-2. Carregar o modelo BERTimbau pré-treinado e o tokenizador.
-3. Criar os DataLoaders de treino e validação com pré-processamento.
-4. Calcular os pesos de classe para a Weighted Loss.
-5. Configurar o otimizador AdamW e o Learning Rate Scheduler.
-6. Executar o loop de treinamento (3 epochs por padrão).
-7. Exibir métricas detalhadas (F1, Precision, Recall, Confusion Matrix) ao final de cada epoch.
-8. Salvar o modelo treinado em `checkpoints/`.
+1. Fixar as seeds para reprodutibilidade.
+2. Detectar o device disponível (GPU com CUDA, se disponível, ou CPU como fallback).
+3. Carregar o modelo BERTimbau pré-treinado e o tokenizador.
+4. Criar os DataLoaders de treino, validação e teste com pré-processamento.
+5. Calcular os pesos de classe para a Weighted Loss.
+6. Configurar o otimizador AdamW, o Learning Rate Scheduler e o Mixed Precision (GPU).
+7. Executar o loop de treinamento (até 10 epochs) com early stopping (patience=2).
+8. Exibir métricas detalhadas (F1, Precision, Recall, Confusion Matrix) ao final de cada epoch.
+9. Carregar o melhor modelo e avaliar no conjunto de teste separado.
+10. Salvar o modelo treinado e as métricas completas em `checkpoints/`.
 
 ### Modo Inferência
 
@@ -113,24 +121,28 @@ python main.py --infer --checkpoint caminho/para/checkpoint
 
 Os hiperparâmetros são definidos como constantes no topo de `main.py`:
 
-| Parâmetro        | Valor padrão | Descrição                                        |
-| ---------------- | ------------ | ------------------------------------------------ |
-| `BATCH_SIZE`     | 16           | Amostras por lote                                |
-| `LEARNING_RATE`  | 2e-5         | Taxa de aprendizado inicial do AdamW             |
-| `NUM_EPOCHS`     | 3            | Quantidade de epochs de treino                   |
-| `NUM_LABELS`     | 2            | Classes de classificação                         |
-| `WARMUP_RATIO`   | 0.1          | Fração dos steps totais usada para warmup do LR  |
-| `CHECKPOINT_DIR` | checkpoints/ | Diretório para salvar o modelo treinado          |
+| Parâmetro        | Valor padrão | Descrição                                              |
+| ---------------- | ------------ | ------------------------------------------------------ |
+| `BATCH_SIZE`     | 16           | Amostras por lote                                      |
+| `LEARNING_RATE`  | 2e-5         | Taxa de aprendizado inicial do AdamW                   |
+| `NUM_EPOCHS`     | 10           | Quantidade máxima de epochs (early stopping pode parar antes) |
+| `NUM_LABELS`     | 2            | Classes de classificação                               |
+| `WARMUP_RATIO`   | 0.1          | Fração dos steps totais usada para warmup do LR        |
+| `CHECKPOINT_DIR` | checkpoints/ | Diretório para salvar modelo e métricas                |
+| `SEED`           | 42           | Seed global para reprodutibilidade                     |
+| `PATIENCE`       | 2            | Epochs sem melhora na val_loss antes do early stopping |
+| `MAX_GRAD_NORM`  | 1.0          | Norma máxima para gradient clipping                    |
 
 ## Dependências
 
-| Pacote           | Uso                                              |
-| ---------------- | ------------------------------------------------ |
-| `torch`          | Framework de deep learning                       |
-| `transformers`   | Modelos pré-treinados, tokenizadores, schedulers |
-| `datasets`       | Carregamento de datasets do Hugging Face Hub     |
-| `accelerate`     | Utilitários para treinamento distribuído         |
-| `scikit-learn`   | Métricas de avaliação (F1, Precision, Recall)    |
+| Pacote           | Uso                                                       |
+| ---------------- | --------------------------------------------------------- |
+| `torch`          | Framework de deep learning (inclui AMP para mixed precision) |
+| `transformers`   | Modelos pré-treinados, tokenizadores, schedulers          |
+| `datasets`       | Carregamento de datasets do Hugging Face Hub              |
+| `accelerate`     | Utilitários para treinamento distribuído                  |
+| `scikit-learn`   | Métricas de avaliação (F1, Precision, Recall)             |
+| `numpy`          | Operações numéricas e seeds para reprodutibilidade        |
 
 ## Equipe e Divisão de Tarefas
 

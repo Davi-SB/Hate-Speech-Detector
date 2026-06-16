@@ -1,0 +1,113 @@
+{
+  "config": {
+    "seed": 42,
+    "batch_size": 16,
+    "learning_rate": 2e-05,
+    "max_epochs": 10,
+    "warmup_ratio": 0.1,
+    "max_grad_norm": 1.0,
+    "patience": 2,
+    "label_smoothing": 0.1,
+    "weight_decay": 0.01,
+    "freeze_layers": 6,
+    "mixed_precision": true,
+    "device": "cuda"
+  },
+  "training_history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.586032,
+      "val_loss": 0.533724,
+      "accuracy": 0.754286,
+      "precision": 0.694059,
+      "recall": 0.772026,
+      "f1": 0.73097,
+      "confusion_matrix": [
+        [
+          883,
+          309
+        ],
+        [
+          207,
+          701
+        ]
+      ]
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.512065,
+      "val_loss": 0.51099,
+      "accuracy": 0.761905,
+      "precision": 0.674061,
+      "recall": 0.870044,
+      "f1": 0.759615,
+      "confusion_matrix": [
+        [
+          810,
+          382
+        ],
+        [
+          118,
+          790
+        ]
+      ]
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.474364,
+      "val_loss": 0.514285,
+      "accuracy": 0.759524,
+      "precision": 0.665571,
+      "recall": 0.89207,
+      "f1": 0.762353,
+      "confusion_matrix": [
+        [
+          785,
+          407
+        ],
+        [
+          98,
+          810
+        ]
+      ]
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.432862,
+      "val_loss": 0.548334,
+      "accuracy": 0.770476,
+      "precision": 0.720954,
+      "recall": 0.765419,
+      "f1": 0.742521,
+      "confusion_matrix": [
+        [
+          923,
+          269
+        ],
+        [
+          213,
+          695
+        ]
+      ]
+    }
+  ],
+  "best_epoch": 2,
+  "early_stopped": true,
+  "test_metrics": {
+    "val_loss": 0.516681,
+    "accuracy": 0.762381,
+    "precision": 0.69594,
+    "recall": 0.864198,
+    "f1": 0.770996,
+    "confusion_matrix": [
+      [
+        761,
+        367
+      ],
+      [
+        132,
+        840
+      ]
+    ]
+  }
+}

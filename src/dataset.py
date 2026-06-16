@@ -105,14 +105,14 @@ def clean_text(text: str) -> str:
 
 
 def _build_label_mappings(
-    train_source: Dataset,
-    eval_source: Dataset,
+    splits: list[Dataset],
     label_column: str,
     label_text_column: str | None,
 ) -> tuple[dict[Any, int], dict[int, str]]:
-    train_labels = [_normalize_label_value(value) for value in train_source[label_column]]
-    eval_labels = [_normalize_label_value(value) for value in eval_source[label_column]]
-    unique_labels = sorted(set(train_labels).union(set(eval_labels)))
+    all_labels: set[Any] = set()
+    for split in splits:
+        all_labels.update(_normalize_label_value(v) for v in split[label_column])
+    unique_labels = sorted(all_labels)
 
     label2id: dict[Any, int] = {label: index for index, label in enumerate(unique_labels)}
 
@@ -121,7 +121,7 @@ def _build_label_mappings(
         return label2id, id2label
 
     raw_to_text: dict[Any, str] = {}
-    for split in (train_source, eval_source):
+    for split in splits:
         for raw_label, label_text in zip(split[label_column], split[label_text_column]):
             normalized_label = _normalize_label_value(raw_label)
             raw_to_text.setdefault(normalized_label, str(label_text))
@@ -167,31 +167,48 @@ def _prepare_split(
 def create_dataloaders(
     tokenizer: PreTrainedTokenizerBase,
     batch_size: int,
-) -> tuple[DataLoader, DataLoader]:
-    """Carrega o dataset, limpa, tokeniza e retorna os DataLoaders."""
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    """Carrega o dataset, limpa, tokeniza e retorna os DataLoaders (treino, validação, teste)."""
     dataset = load_dataset(DATASET_NAME)
 
     if isinstance(dataset, DatasetDict):
-        if "train" in dataset:
-            train_source = dataset["train"]
-        else:
-            split_names = list(dataset.keys())
-            train_source = dataset[split_names[0]]
+        train_source = dataset.get("train")
+        if train_source is None:
+            train_source = dataset[list(dataset.keys())[0]]
 
-        if "validation" in dataset:
-            eval_source = dataset["validation"]
-        elif "eval" in dataset:
-            eval_source = dataset["eval"]
-        elif "test" in dataset:
-            eval_source = dataset["test"]
-        else:
-            split = train_source.train_test_split(test_size=0.2, seed=42)
+        val_key = (
+            "validation" if "validation" in dataset
+            else ("eval" if "eval" in dataset else None)
+        )
+        test_key = "test" if "test" in dataset else None
+
+        val_source = dataset[val_key] if val_key else None
+        test_source = dataset[test_key] if test_key else None
+
+        if val_source is not None and test_source is not None:
+            pass
+        elif val_source is None and test_source is not None:
+            split = train_source.train_test_split(test_size=0.15, seed=42)
             train_source = split["train"]
-            eval_source = split["test"]
+            val_source = split["test"]
+        elif val_source is not None and test_source is None:
+            split = train_source.train_test_split(test_size=0.15, seed=42)
+            train_source = split["train"]
+            test_source = split["test"]
+        else:
+            split1 = train_source.train_test_split(test_size=0.3, seed=42)
+            train_source = split1["train"]
+            remaining = split1["test"]
+            split2 = remaining.train_test_split(test_size=0.5, seed=42)
+            val_source = split2["train"]
+            test_source = split2["test"]
     else:
-        split = dataset.train_test_split(test_size=0.2, seed=42)
-        train_source = split["train"]
-        eval_source = split["test"]
+        split1 = dataset.train_test_split(test_size=0.3, seed=42)
+        train_source = split1["train"]
+        remaining = split1["test"]
+        split2 = remaining.train_test_split(test_size=0.5, seed=42)
+        val_source = split2["train"]
+        test_source = split2["test"]
 
     text_column = _pick_column(train_source.column_names, TEXT_COLUMN_CANDIDATES)
     label_column = _pick_column(train_source.column_names, LABEL_COLUMN_CANDIDATES)
@@ -201,8 +218,7 @@ def create_dataloaders(
     )
 
     label2id, id2label = _build_label_mappings(
-        train_source=train_source,
-        eval_source=eval_source,
+        splits=[train_source, val_source, test_source],
         label_column=label_column,
         label_text_column=label_text_column,
     )
@@ -212,23 +228,19 @@ def create_dataloaders(
     ID2LABEL = id2label
 
     train_dataset = _prepare_split(
-        train_source,
-        tokenizer,
-        text_column,
-        label_column,
-        label2id,
+        train_source, tokenizer, text_column, label_column, label2id,
     )
-    eval_dataset = _prepare_split(
-        eval_source,
-        tokenizer,
-        text_column,
-        label_column,
-        label2id,
+    val_dataset = _prepare_split(
+        val_source, tokenizer, text_column, label_column, label2id,
+    )
+    test_dataset = _prepare_split(
+        test_source, tokenizer, text_column, label_column, label2id,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, eval_loader
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader
 
 
 def compute_class_weights(dataloader: DataLoader) -> list[float]:

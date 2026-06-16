@@ -17,9 +17,12 @@ Modos de execução:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from transformers import get_linear_schedule_with_warmup
 
@@ -31,10 +34,13 @@ from src.model import load_model
 
 BATCH_SIZE = 16
 LEARNING_RATE = 2e-5
-NUM_EPOCHS = 3
+NUM_EPOCHS = 10
 NUM_LABELS = 2
 WARMUP_RATIO = 0.1
 CHECKPOINT_DIR = Path("checkpoints")
+SEED = 42
+PATIENCE = 2
+MAX_GRAD_NORM = 1.0
 
 # ── Logging ───────────────────────────────────────────────────────
 
@@ -44,6 +50,17 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def set_seed(seed: int) -> None:
+    """Fixa as seeds para reprodutibilidade."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ── CLI ───────────────────────────────────────────────────────────
@@ -79,8 +96,17 @@ def parse_args() -> argparse.Namespace:
 def train(args: argparse.Namespace) -> None:
     """Pipeline completo de treinamento."""
 
+    set_seed(SEED)
+    logger.info("Seed fixada: %d", SEED)
+
     # 1. Device ────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        logger.info("GPU detectada: %s", torch.cuda.get_device_name(0))
+    else:
+        logger.warning(
+            "CUDA não disponível — treinamento será em CPU (mais lento)."
+        )
     logger.info("Device selecionado: %s", device)
 
     # 2. Modelo e tokenizador (Integrante C) ───────────────────────
@@ -89,15 +115,12 @@ def train(args: argparse.Namespace) -> None:
 
     # 3. DataLoaders (Integrante B) ────────────────────────────────
     logger.info("Criando DataLoaders (batch_size=%d)…", BATCH_SIZE)
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, test_loader = create_dataloaders(
         tokenizer=tokenizer,
         batch_size=BATCH_SIZE,
     )
 
     # 4. Class Weights + Loss ponderada (Integrante B) ─────────────
-    # compute_class_weights() é implementada pelo Integrante B em
-    # dataset.py. Ela calcula pesos inversamente proporcionais à
-    # frequência de cada classe para combater o desbalanceamento.
     logger.info("Calculando class weights…")
     class_weights = compute_class_weights(train_loader)
     loss_fn = torch.nn.CrossEntropyLoss(
@@ -113,9 +136,7 @@ def train(args: argparse.Namespace) -> None:
         f"{sum(p.numel() for p in model.parameters()):,}",
     )
 
-    # 6. Learning Rate Scheduler (Integrante A) ────────────────────
-    # Warmup linear nos primeiros passos, seguido de decay linear
-    # até zero. Estratégia padrão para fine-tuning de Transformers.
+    # 6. Learning Rate Scheduler ───────────────────────────────────
     total_steps = len(train_loader) * NUM_EPOCHS
     warmup_steps = int(total_steps * WARMUP_RATIO)
 
@@ -130,29 +151,130 @@ def train(args: argparse.Namespace) -> None:
         total_steps,
     )
 
-    # 7. Loop de treinamento ───────────────────────────────────────
-    # train_one_epoch (Integrante D): recebe scheduler e loss_fn
-    # evaluate        (Integrante E): retorna dict de métricas
-    # print_report    (Integrante E): exibe métricas formatadas
-    logger.info("Iniciando treinamento — %d epoch(s)", NUM_EPOCHS)
+    # 7. Mixed Precision ───────────────────────────────────────────
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    logger.info(
+        "Mixed precision (fp16): %s",
+        "ativado" if use_amp else "desativado (CPU)",
+    )
+
+    # 8. Loop de treinamento com early stopping ────────────────────
+    logger.info(
+        "Iniciando treinamento — até %d epoch(s), patience=%d",
+        NUM_EPOCHS, PATIENCE,
+    )
+
+    checkpoint_dir = Path(args.checkpoint)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+    best_epoch = 0
+    metrics_history: list[dict] = []
 
     for epoch in range(1, NUM_EPOCHS + 1):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device,
             scheduler=scheduler,
             loss_fn=loss_fn,
+            max_grad_norm=MAX_GRAD_NORM,
+            scaler=scaler,
         )
 
-        metrics = evaluate(model, val_loader, device, loss_fn=loss_fn)
+        metrics = evaluate(
+            model, val_loader, device, loss_fn=loss_fn, use_amp=use_amp,
+        )
 
         logger.info("Epoch %d/%d  ·  train_loss=%.4f", epoch, NUM_EPOCHS, train_loss)
         print_report(metrics, epoch, NUM_EPOCHS)
 
-    # 8. Checkpoint ────────────────────────────────────────────────
-    checkpoint_dir = Path(args.checkpoint)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    save_checkpoint(model, tokenizer, str(checkpoint_dir))
-    logger.info("Checkpoint salvo em %s", checkpoint_dir.resolve())
+        epoch_record = {
+            "epoch": epoch,
+            "train_loss": round(train_loss, 6),
+            "val_loss": round(metrics["val_loss"], 6),
+            "accuracy": round(metrics["accuracy"], 6),
+            "precision": round(metrics["precision"], 6),
+            "recall": round(metrics["recall"], 6),
+            "f1": round(metrics["f1"], 6),
+            "confusion_matrix": np.asarray(metrics["confusion_matrix"]).tolist(),
+        }
+        metrics_history.append(epoch_record)
+
+        if metrics["val_loss"] < best_val_loss:
+            best_val_loss = metrics["val_loss"]
+            best_epoch = epoch
+            patience_counter = 0
+            save_checkpoint(model, tokenizer, str(checkpoint_dir))
+            logger.info(
+                "Melhor val_loss=%.4f — checkpoint salvo em %s",
+                best_val_loss, checkpoint_dir.resolve(),
+            )
+        else:
+            patience_counter += 1
+            logger.info(
+                "val_loss não melhorou (%.4f >= %.4f) — patience %d/%d",
+                metrics["val_loss"], best_val_loss,
+                patience_counter, PATIENCE,
+            )
+            if patience_counter >= PATIENCE:
+                logger.info("Early stopping ativado no epoch %d.", epoch)
+                break
+
+    # 9. Carregar melhor modelo para avaliação final ────────────────
+    logger.info(
+        "Carregando melhor modelo (epoch %d) para avaliação no teste…",
+        best_epoch,
+    )
+    model.load_state_dict(
+        torch.load(
+            str(checkpoint_dir / "model.pt"),
+            map_location=device,
+            weights_only=True,
+        )
+    )
+
+    # 10. Avaliação no conjunto de teste ────────────────────────────
+    test_metrics = evaluate(
+        model, test_loader, device, loss_fn=loss_fn, use_amp=use_amp,
+    )
+    print_report(
+        test_metrics, best_epoch, NUM_EPOCHS,
+        title="AVALIAÇÃO FINAL — CONJUNTO DE TESTE",
+    )
+
+    # 11. Salvar métricas ──────────────────────────────────────────
+    results = {
+        "config": {
+            "seed": SEED,
+            "batch_size": BATCH_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "max_epochs": NUM_EPOCHS,
+            "warmup_ratio": WARMUP_RATIO,
+            "max_grad_norm": MAX_GRAD_NORM,
+            "patience": PATIENCE,
+            "mixed_precision": use_amp,
+            "device": str(device),
+        },
+        "training_history": metrics_history,
+        "best_epoch": best_epoch,
+        "early_stopped": patience_counter >= PATIENCE,
+        "test_metrics": {
+            "val_loss": round(test_metrics["val_loss"], 6),
+            "accuracy": round(test_metrics["accuracy"], 6),
+            "precision": round(test_metrics["precision"], 6),
+            "recall": round(test_metrics["recall"], 6),
+            "f1": round(test_metrics["f1"], 6),
+            "confusion_matrix": np.asarray(
+                test_metrics["confusion_matrix"]
+            ).tolist(),
+        },
+    }
+
+    metrics_path = checkpoint_dir / "metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    logger.info("Métricas salvas em %s", metrics_path.resolve())
 
     logger.info("Pipeline de treinamento concluído com sucesso.")
 

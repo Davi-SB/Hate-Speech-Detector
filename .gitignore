@@ -25,8 +25,8 @@ env/
 Thumbs.db
 
 # Project: model checkpoints
-checkpoints/
 *.pdftests/
 
 Plano Entrega Parcial - Discurso de odio DL.md
-Plano Entrega Final - Discurso de ódio DL.md
+Plano Entrega Final - Discurso de odio.md
+*.pdf
